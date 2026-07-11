@@ -71,6 +71,18 @@ class ShopeeBrowser {
   async _loadShopee() {
     await this.page.goto(SHOPEE_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
     await this.page.waitForTimeout(3500);
+    await this._dismissModal();
+  }
+
+  async _dismissModal() {
+    // Tutup modal pilih bahasa/region ("Worldmap") yang nutupin halaman.
+    try {
+      const btn = await this.page.$('button:has-text("Bahasa Indonesia")');
+      if (btn) {
+        await btn.click({ timeout: 5000, force: true });
+        await this.page.waitForTimeout(1000);
+      }
+    } catch {}
   }
 
   async _teardown() {
