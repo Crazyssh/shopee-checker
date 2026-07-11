@@ -166,11 +166,9 @@ function interpret(json) {
   if (code === ANTIBOT_ERROR) return { registered: null, code, blocked: true };
   if (code !== 0 && code !== null) return { registered: null, code };
 
-  // TODO: kunci mapping setelah lihat response bersih (error:0) pertama.
-  const guess =
-    typeof json["2"] === "boolean" ? json["2"] :
-    typeof json["5"] === "boolean" ? json["5"] : null;
-  return { registered: guess, code };
+  // Response bersih: data.exist = true (terdaftar) / false (belum).
+  const exist = json && json.data ? json.data.exist : undefined;
+  return { registered: typeof exist === "boolean" ? exist : null, code };
 }
 
 // ==================== HTTP API ====================
