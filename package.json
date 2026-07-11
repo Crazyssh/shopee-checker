@@ -1,0 +1,17 @@
+{
+  "name": "shopee-checker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Microservice cek status akun Shopee (terdaftar/tidak) via headless browser. Deploy terpisah dari web utama.",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "install-browser": "playwright install chromium",
+    "install-deps": "playwright install-deps chromium"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.49.1"
+  }
+}
