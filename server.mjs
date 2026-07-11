@@ -1,26 +1,22 @@
 // Shopee Account Checker — microservice terpisah.
 //
-// Cara kerja: Playwright buka halaman Shopee (reset password / phone flow),
-// biarkan JS SDK Shopee init & generate signature anti-bot (x-sap-sec dkk),
-// lalu panggil endpoint check_account_exist DARI DALAM konteks halaman
-// (page.evaluate + fetch) supaya interceptor Shopee otomatis nyuntik header valid.
+// Strategi: Playwright buka halaman reset Shopee, JALANKAN UI-nya (ketik nomor,
+// klik lanjut) supaya JS Shopee sendiri yang nembak `check_account_exist` DENGAN
+// signature anti-bot valid. Kita cuma INTERCEPT response-nya.
 //
-// Kita TIDAK reverse-engineer signature — SDK Shopee sendiri yang bikin.
+// (Manggil endpoint langsung via fetch di page context TIDAK dapat signature →
+//  ditolak 403 error_forbidden / 90309999. Makanya harus lewat UI.)
 
 import express from "express";
 import { chromium } from "playwright";
 
 // ==================== Config ====================
 const PORT = Number(process.env.PORT) || 4100;
-const API_KEY = process.env.API_KEY || ""; // WAJIB set di production
+const API_KEY = process.env.API_KEY || "";
 const SHOPEE_URL =
   process.env.SHOPEE_URL || "https://shopee.co.id/buyer/reset?scenario=7";
-const CHECK_ENDPOINT =
-  "https://shopee.co.id/api/v4/account/basic/check_account_exist";
+const CHECK_PATH = "/api/v4/account/basic/check_account_exist";
 const HEADLESS = process.env.HEADLESS !== "false";
-// Refresh halaman tiap N cek biar signature/session tetap fresh.
-const MAX_CHECKS_BEFORE_REFRESH = Number(process.env.MAX_CHECKS_BEFORE_REFRESH) || 40;
-// Kode error anti-bot Shopee (signature invalid/expired).
 const ANTIBOT_ERROR = 90309999;
 
 // ==================== Browser manager ====================
@@ -30,7 +26,6 @@ class ShopeeBrowser {
     this.context = null;
     this.page = null;
     this.ready = false;
-    this.checksSinceRefresh = 0;
     this.initPromise = null;
   }
 
@@ -63,7 +58,6 @@ class ShopeeBrowser {
       this.page = await this.context.newPage();
       await this._loadShopee();
       this.ready = true;
-      this.checksSinceRefresh = 0;
       console.log("[browser] ready");
     } catch (err) {
       console.error("[browser] init failed:", err.message);
@@ -75,101 +69,92 @@ class ShopeeBrowser {
   }
 
   async _loadShopee() {
-    console.log("[browser] navigating to Shopee...");
-    await this.page.goto(SHOPEE_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-    // Kasih waktu SDK anti-bot init (generate token device).
-    await this.page.waitForTimeout(4000);
-  }
-
-  async refresh() {
-    try {
-      await this._loadShopee();
-      this.checksSinceRefresh = 0;
-    } catch (err) {
-      console.error("[browser] refresh failed, full reinit:", err.message);
-      this.ready = false;
-      await this.ensureReady();
-    }
+    await this.page.goto(SHOPEE_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await this.page.waitForTimeout(3500);
   }
 
   async _teardown() {
     try { if (this.page && !this.page.isClosed()) await this.page.close(); } catch {}
     try { if (this.context) await this.context.close(); } catch {}
     try { if (this.browser) await this.browser.close(); } catch {}
-    this.page = null;
-    this.context = null;
-    this.browser = null;
-    this.ready = false;
+    this.page = null; this.context = null; this.browser = null; this.ready = false;
   }
 
-  /** Jalankan check_account_exist DI DALAM konteks halaman Shopee. */
-  async _callCheck(phone) {
-    return this.page.evaluate(
-      async ({ endpoint, phone }) => {
-        try {
-          const res = await fetch(endpoint, {
-            method: "POST",
-            headers: {
-              accept: "application/json",
-              "content-type": "application/json",
-              "x-api-source": "pc",
-              "x-shopee-language": "id",
-              "x-requested-with": "XMLHttpRequest",
-            },
-            body: JSON.stringify({ phone, scenario: 2 }),
-            credentials: "include",
-          });
-          const text = await res.text();
-          let json = null;
-          try { json = JSON.parse(text); } catch {}
-          return { status: res.status, json, text };
-        } catch (e) {
-          return { status: 0, json: null, text: String(e) };
-        }
-      },
-      { endpoint: CHECK_ENDPOINT, phone }
-    );
+  /** DEBUG: dump semua input & button di halaman reset (buat nyari selector). */
+  async inspect() {
+    await this.ensureReady();
+    await this._loadShopee();
+    return this.page.evaluate(() => {
+      const inputs = [...document.querySelectorAll("input")].map((el) => ({
+        name: el.name || null,
+        type: el.type || null,
+        placeholder: el.placeholder || null,
+        id: el.id || null,
+        className: (el.className || "").slice(0, 80),
+      }));
+      const buttons = [...document.querySelectorAll("button")].map((el) => ({
+        text: (el.textContent || "").trim().slice(0, 40),
+        type: el.type || null,
+        className: (el.className || "").slice(0, 80),
+      }));
+      return { url: location.href, title: document.title, inputs, buttons };
+    });
   }
 
+  /**
+   * Cek nomor via UI: ketik nomor -> submit -> intercept response check_account_exist.
+   * @param {string} phone  format 62xxxxxxxxxx
+   */
   async check(phone) {
     await this.ensureReady();
+    const page = this.page;
 
-    if (this.checksSinceRefresh >= MAX_CHECKS_BEFORE_REFRESH) {
-      await this.refresh();
+    // Reload biar form fresh.
+    await this._loadShopee();
+
+    // Format nomor untuk field: Shopee ID biasanya prefill +62, jadi ketik tanpa "62".
+    const local = phone.replace(/^62/, "");
+
+    // Pasang listener response SEBELUM submit.
+    const respPromise = page
+      .waitForResponse((r) => r.url().includes(CHECK_PATH), { timeout: 20000 })
+      .catch(() => null);
+
+    // Cari input nomor (field text/tel pertama yang visible).
+    const input = await page.waitForSelector(
+      'input[type="text"], input[type="tel"], input:not([type="hidden"])',
+      { timeout: 15000 }
+    );
+    await input.click();
+    await input.fill("");
+    await input.type(local, { delay: 30 });
+    await page.waitForTimeout(300);
+
+    // Submit: coba Enter dulu, lalu klik tombol utama kalau ada.
+    await page.keyboard.press("Enter");
+    const btn = await page.$(
+      'button[type="submit"], button.btn-solid-primary, button:has-text("BERIKUTNYA"), button:has-text("Berikutnya"), button:has-text("Next")'
+    );
+    if (btn) { try { await btn.click({ timeout: 3000 }); } catch {} }
+
+    const resp = await respPromise;
+    if (!resp) {
+      return { status: 0, json: null, text: "check_account_exist tidak terpanggil (cek selector via /inspect)" };
     }
-
-    let result = await this._callCheck(phone);
-    this.checksSinceRefresh++;
-
-    // Kalau kena anti-bot → reload halaman (regenerate signature) & coba sekali lagi.
-    if (result.json && result.json.error === ANTIBOT_ERROR) {
-      console.warn("[browser] anti-bot hit, reloading & retrying...");
-      await this.refresh();
-      result = await this._callCheck(phone);
-      this.checksSinceRefresh++;
-    }
-
-    return result;
+    let json = null, text = "";
+    try { json = await resp.json(); } catch { try { text = await resp.text(); } catch {} }
+    return { status: resp.status(), json, text };
   }
 }
 
 // ==================== Interpretasi hasil ====================
-// Response check_account_exist pakai key numerik yang di-obfuscate.
-// Contoh (saat anti-bot): {"5":false,"2":false,"0":2,"3":<err>,"error":<err>,...}
-// FIELD MAPPING existence akan difinalisasi setelah dapat response BERSIH pertama
-// (error === 0) dari VPS target — bandingkan nomor terdaftar vs tidak.
-// Sementara: return raw + tebakan best-effort.
 function interpret(json) {
   if (!json) return { registered: null, code: null };
   const code = typeof json.error === "number" ? json.error : null;
   if (code === ANTIBOT_ERROR) return { registered: null, code, blocked: true };
   if (code !== 0 && code !== null) return { registered: null, code };
 
-  // TODO: kunci mapping setelah lihat response bersih pertama.
-  // Kandidat field boolean existence: json["2"] atau json["5"].
+  // TODO: kunci mapping setelah lihat response bersih (error:0) pertama.
   const guess =
     typeof json["2"] === "boolean" ? json["2"] :
     typeof json["5"] === "boolean" ? json["5"] : null;
@@ -179,7 +164,6 @@ function interpret(json) {
 // ==================== HTTP API ====================
 const shopee = new ShopeeBrowser();
 
-// Antrian serial — 1 page, 1 cek dalam satu waktu.
 let queue = Promise.resolve();
 function enqueue(fn) {
   const run = queue.then(fn, fn);
@@ -199,21 +183,29 @@ app.use(express.json());
 
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
-  if (!API_KEY) return next(); // kalau API_KEY kosong (dev), skip auth
+  if (!API_KEY) return next();
   const key = req.headers["x-api-key"] || req.query.key;
   if (key !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, ready: shopee.ready, checks: shopee.checksSinceRefresh });
+  res.json({ ok: true, ready: shopee.ready });
+});
+
+// DEBUG: lihat struktur form reset (buat nyari selector).
+app.get("/inspect", async (req, res) => {
+  try {
+    const info = await enqueue(() => shopee.inspect());
+    res.json(info);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/check", async (req, res) => {
   const phone = normalizePhone(req.query.phone);
-  if (phone.length < 9) {
-    return res.status(400).json({ error: "Nomor tidak valid" });
-  }
+  if (phone.length < 9) return res.status(400).json({ error: "Nomor tidak valid" });
   try {
     const result = await enqueue(() => shopee.check(phone));
     const { registered, code, blocked } = interpret(result.json);
@@ -233,6 +225,5 @@ app.get("/check", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[server] shopee-checker listening on :${PORT}`);
-  // Warm-up browser di background.
   shopee.ensureReady().catch((e) => console.error("[server] warmup failed:", e.message));
 });
