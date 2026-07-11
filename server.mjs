@@ -113,7 +113,7 @@ class ShopeeBrowser {
     await this._loadShopee();
 
     // Format nomor untuk field: Shopee ID biasanya prefill +62, jadi ketik tanpa "62".
-    const local = phone.replace(/^62/, "");
+    const local = "0" + phone.replace(/^62/, "");
 
     // Pasang listener response SEBELUM submit.
     const respPromise = page
@@ -133,7 +133,7 @@ class ShopeeBrowser {
     // Submit: coba Enter dulu, lalu klik tombol utama kalau ada.
     await page.keyboard.press("Enter");
     const btn = await page.$(
-      'button[type="submit"], button.btn-solid-primary, button:has-text("BERIKUTNYA"), button:has-text("Berikutnya"), button:has-text("Next")'
+      'button:has-text("Berikutnya")'
     );
     if (btn) { try { await btn.click({ timeout: 3000 }); } catch {} }
 
